@@ -8,7 +8,10 @@ Terminal para Windows, al estilo de Warp: el comando se escribe en un **editor d
 - **Historial en bloques:** cada comando aparece como `> comando` y su salida justo debajo, sin la ruta del prompt.
 - **Chips de contexto:** el shell actual, la versión de Node (en proyectos con `package.json`), la ruta, la rama de git y la cantidad de archivos cambiados.
 - **Sugerencias** sacadas de tu historial, que incluye el de PowerShell. Se aceptan con → o Tab.
-- **Pestañas verticales:** cada una muestra el ícono del shell que está corriendo (PS, WSL, bash, cmd).
+- **Autocompletar rutas** con Tab (si no hay ruta que completar, acepta la sugerencia). Si hay varias coincidencias, completa la parte común.
+- **Copiar de la salida:** arrastra el mouse sobre el texto y presiona Ctrl+C. Si hay texto seleccionado, Ctrl+C copia en vez de interrumpir el programa.
+- **Pestañas verticales:** cada una muestra un ícono con el color del shell que está corriendo (azul PowerShell, naranja WSL, verde bash, gris cmd).
+- **Abre en tu carpeta de usuario** (`%USERPROFILE%`), igual que las pestañas nuevas.
 - **Cualquier shell:** PowerShell, pwsh, cmd, WSL y Git Bash. Al entrar a WSL desde PowerShell, el ícono y los chips cambian solos.
 - **Modo directo:** mientras corre un programa (`vim`, `python`, una contraseña), las teclas van directo a ese programa.
 
@@ -34,8 +37,10 @@ zhur.exe "C:\Program Files\Git\bin\bash.exe"
 |---|---|
 | Enter / Shift+Enter | Ejecutar / nueva línea |
 | ↑ ↓ | Recorrer el historial |
-| → o Tab | Aceptar la sugerencia |
-| Ctrl+Shift+T / Ctrl+Shift+W | Abrir / cerrar pestaña |
+| Tab | Completar ruta (si no hay, acepta la sugerencia) |
+| → | Aceptar la sugerencia |
+| Arrastrar + Ctrl+C | Copiar texto de la salida |
+| Ctrl+Shift+T / Ctrl+Shift+W | Abrir / cerrar pestaña (también con la × que sale al pasar el mouse) |
 | Ctrl+Tab | Cambiar de pestaña |
 
 ## Compilar
@@ -57,8 +62,7 @@ El ejecutable queda en `target\release\zhur.exe`. Incluye el runtime de C (ver `
 
 ## Limitaciones conocidas
 
-- Tab no autocompleta rutas ni comandos, solo acepta sugerencias del historial.
-- No se puede seleccionar ni copiar texto de la salida.
+- Tab completa rutas, no comandos, y no muestra la lista de candidatos. En carpetas solo de WSL (`/home/...`) no completa.
 - En carpetas solo de WSL (`/home/...`) no se muestra la información de git ni de Node.
 - Si en WSL usas zsh en lugar de bash, zhur no detecta el prompt y funciona como una terminal clásica.
 - Solo funciona en Windows.

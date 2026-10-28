@@ -14,6 +14,8 @@ use alacritty_terminal::{
     event::{Event as TermEvent, EventListener, WindowSize},
     event_loop::{EventLoop as PtyLoop, EventLoopSender, Msg},
     grid::{Dimensions, Scroll},
+    index::{Column, Line, Point, Side},
+    selection::{Selection as TermSel, SelectionType},
     sync::FairMutex,
     term::{self, Term, TermMode, cell::Flags, color::Colors},
     tty,
@@ -43,6 +45,7 @@ const CARD_PAD: f32 = 12.0;
 const RADIUS: f32 = 10.0;
 const SIDEBAR: f32 = 52.0;
 const BADGE: f32 = 34.0;
+const ICON: f32 = 16.0;
 const MAX_EDITOR_LINES: usize = 8;
 const BLINK: Duration = Duration::from_millis(530);
 
@@ -73,13 +76,14 @@ const SELECTION: u32 = 0x2F4A7A;
 const IDLE: &str = "zhur-idle";
 // The visible prompt is a blue "> ", so each command reads "> cmd" in the history. It ends in "> "
 // on purpose: PSReadLine recolors those two chars (PromptText) red on syntax errors.
-const PS_HOOK: &str = "function global:prompt { $Host.UI.RawUI.WindowTitle='zhur-idle'+(Get-Random)+'?ps?'+$PWD.ProviderPath; [string][char]27+'[38;2;122;162;247m> '+[char]27+'[0m' }";
-const CMD_HOOK: &str = "$E]2;zhur-idle$T?cmd?$P$E\\$E[38;2;122;162;247m$G $E[0m";
-const BASH_HOOK: &str = r#"PS1="\[\e]2;zhur-idle\${RANDOM}?${WSL_DISTRO_NAME:+wsl:}${WSL_DISTRO_NAME:-bash}?\${PWD}\a\e[38;2;122;162;247m\]> \[\e[0m\]""#;
+// It starts with a newline, so a blank row separates blocks; that color is how headers are found.
+const PS_HOOK: &str = "function global:prompt { $Host.UI.RawUI.WindowTitle='zhur-idle'+(Get-Random)+'?ps?'+$PWD.ProviderPath; [string][char]10+[char]27+'[38;2;122;162;247m> '+[char]27+'[0m' }";
+const CMD_HOOK: &str = "$E]2;zhur-idle$T?cmd?$P$E\\$_$E[38;2;122;162;247m$G $E[0m";
+const BASH_HOOK: &str = r#"PS1="\[\e]2;zhur-idle\${RANDOM}?${WSL_DISTRO_NAME:+wsl:}${WSL_DISTRO_NAME:-bash}?\${PWD}\a\]\n\[\e[38;2;122;162;247m\]> \[\e[0m\]""#;
 // Only these fonts are loaded: loading every system font costs memory and startup time.
-const FONTS: [&str; 8] = [
+const FONTS: [&str; 9] = [
     "CascadiaMono.ttf", "consola.ttf", "seguisym.ttf", "seguiemj.ttf", "segoeui.ttf", "msyh.ttc",
-    "YuGothR.ttc", "malgun.ttf",
+    "YuGothR.ttc", "malgun.ttf", "segmdl2.ttf",
 ];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -101,14 +105,15 @@ impl Kind {
             _ => Kind::Other,
         }
     }
-    /// Tab badge: label, background, foreground.
+    /// Tab badge: icon, background, foreground.
     fn badge(self) -> (&'static str, u32, u32) {
+        // Segoe MDL2 Assets: E756 = command prompt, E943 = code.
         match self {
-            Kind::Ps => ("PS", 0x1F4E8C, 0xFFFFFF),
-            Kind::Wsl => ("WSL", 0xE95420, 0xFFFFFF),
-            Kind::Bash => ("$_", 0x24331F, 0x8BC34A),
-            Kind::Cmd => ("C:\\", 0x30343C, 0xD4D4D8),
-            Kind::Other => (">_", 0x30343C, 0xD4D4D8),
+            Kind::Ps => ("\u{E756}", 0x1F4E8C, 0xFFFFFF),
+            Kind::Wsl => ("\u{E756}", 0xE95420, 0xFFFFFF),
+            Kind::Bash => ("\u{E943}", 0x24331F, 0x8BC34A),
+            Kind::Cmd => ("\u{E756}", 0x30343C, 0xD4D4D8),
+            Kind::Other => ("\u{E943}", 0x30343C, 0xD4D4D8),
         }
     }
     fn color(self) -> u32 {
@@ -185,6 +190,52 @@ fn win_path(cwd: &str) -> Option<String> {
         return None;
     }
     Some(format!("{}:\\{}", drive.to_uppercase(), tail.replace('/', "\\")))
+}
+
+/// Local wall-clock time as `HH:MM:SS`, straight from Windows (std has no time zones).
+fn local_time() -> String {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime([u16; 8]); // year, month, weekday, day, hour, minute, second, ms
+    unsafe extern "system" {
+        fn GetLocalTime(t: *mut SystemTime);
+    }
+    let mut t = SystemTime::default();
+    unsafe { GetLocalTime(&mut t) };
+    format!("{:02}:{:02}:{:02}", t.0[4], t.0[5], t.0[6])
+}
+
+/// Completes the last word of `text` as a path under `cwd`; returns the whole new text.
+/// shortcut: several matches only complete their common prefix, no candidate list; add one if missed.
+fn complete_path(text: &str, cwd: &Path, sep: char) -> Option<String> {
+    let quoted = text.matches('"').count() % 2 == 1;
+    let start = if quoted { text.rfind('"')? + 1 } else { text.rfind(char::is_whitespace).map_or(0, |i| i + 1) };
+    let word = &text[start..];
+    let (dir, prefix) = word.split_at(word.rfind(['/', '\\']).map_or(0, |i| i + 1));
+    let sep = dir.chars().last().unwrap_or(sep);
+    let lower = prefix.to_lowercase();
+    let mut names: Vec<(String, bool)> = std::fs::read_dir(cwd.join(dir))
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().into_string().ok()?;
+            n.to_lowercase().starts_with(&lower).then(|| (n, e.path().is_dir()))
+        })
+        .collect();
+    names.sort();
+    // Windows paths ignore case, so the common prefix does too.
+    let mut common: Vec<char> = names.first()?.0.chars().collect();
+    for (n, _) in &names[1..] {
+        let same = common.iter().zip(n.chars()).take_while(|(a, b)| a.to_lowercase().eq(b.to_lowercase())).count();
+        common.truncate(same);
+    }
+    let mut common: String = common.into_iter().collect();
+    if names.len() == 1 && names[0].1 {
+        common.push(sep);
+    }
+    let quote = if !quoted && common.contains(' ') { "\"" } else { "" };
+    let new = format!("{}{quote}{dir}{common}", &text[..start]);
+    (new != text).then_some(new)
 }
 
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
@@ -330,6 +381,14 @@ fn label_buf(fs: &mut FontSystem, metrics: Metrics, text: &str, c: u32, bold: bo
     b
 }
 
+/// One glyph from the Windows icon font, `size` px square.
+fn icon_buf(fs: &mut FontSystem, size: f32, glyph: &str, c: u32) -> Buffer {
+    let mut b = Buffer::new(fs, Metrics::new(size, size));
+    b.set_text(glyph, &Attrs::new().family(Family::Name("Segoe MDL2 Assets")).color(color(c)), Shaping::Advanced, None);
+    b.shape_until_scroll(fs, false);
+    b
+}
+
 fn line_w(b: &Buffer) -> f32 {
     b.layout_runs().next().map_or(0.0, |r| r.line_w)
 }
@@ -348,16 +407,21 @@ struct Tab {
     // Cached grid render; rebuilt only when the terminal changed.
     term_dirty: bool,
     cell_bgs: Vec<(usize, i32, Rgb)>,
+    // Fallback-font glyphs drawn on their own: (x from the text's left, row, buffer).
+    glyphs: Vec<(f32, i32, Buffer)>,
     term_cursor: Option<(usize, i32)>,
     shift: usize,
-    // Commands sent: (absolute grid line where the shell echoed it, first line of the command).
-    blocks: Vec<(usize, String)>,
-    headers: Vec<i32>,
+    // Commands sent: (absolute grid line where the shell echoed it, first line of the command, run time).
+    blocks: Vec<(usize, String, String)>,
+    // Visible header rows, with their run time laid out for the right edge.
+    headers: Vec<(i32, Buffer)>,
     idle: bool,
     integrated: bool,
     undo: Vec<String>,
     typing: bool,
     hist_pos: usize,
+    // Windows path of the shell's folder, for Tab completion.
+    cwd: Option<String>,
 }
 
 impl Tab {
@@ -407,10 +471,18 @@ impl Tab {
     }
 
     /// Re-reads the grid into the text buffer, cell backgrounds and block headers.
-    fn build_term(&mut self, fs: &mut FontSystem) {
+    fn build_term(&mut self, fs: &mut FontSystem, cw: f32) {
         let mut text = String::new();
         let mut row_starts = Vec::new();
         let mut spans: Vec<(usize, usize, Rgb, bool)> = Vec::new();
+        let mut prompt_rows = Vec::new();
+        // Chars missing from the mono font come from fallback fonts whose advance cosmic-text rounds
+        // to whole cells (✔ takes 2), shifting the rest of the row. They are drawn apart, at their column.
+        let mono_font = fs.db().faces().find(|f| f.families.iter().any(|(n, _)| n == "Cascadia Mono")).map(|f| f.id);
+        let mono_font = mono_font.and_then(|id| fs.get_font(id, Weight::NORMAL));
+        let in_mono = |c: char| c.is_ascii() || mono_font.as_ref().is_none_or(|f| f.as_swash().charmap().map(c) != 0);
+        let mut foreign: Vec<(usize, i32, String, Rgb, usize)> = Vec::new();
+        self.glyphs.clear();
         self.cell_bgs.clear();
         self.headers.clear();
         {
@@ -439,14 +511,28 @@ impl Tab {
                 if cell.flags.contains(Flags::INVERSE) {
                     std::mem::swap(&mut fg, &mut bg);
                 }
-                if bg != rgb(BG) {
+                if content.selection.is_some_and(|s| s.contains(cell.point)) {
+                    self.cell_bgs.push((cell.point.column.0, r, rgb(SELECTION)));
+                } else if bg != rgb(BG) {
                     self.cell_bgs.push((cell.point.column.0, r, bg));
+                }
+                if cell.point.column.0 == 0 && cell.c == '>' && fg == rgb(ACCENT) {
+                    prompt_rows.push(row_starts.len() - 1);
                 }
                 let bold = cell.flags.contains(Flags::BOLD);
                 let start = text.len();
-                text.push(if cell.flags.contains(Flags::HIDDEN) { ' ' } else { cell.c });
-                if let Some(z) = cell.zerowidth() {
-                    text.extend(z);
+                if cell.flags.contains(Flags::HIDDEN) {
+                    text.push(' ');
+                } else if in_mono(cell.c) {
+                    text.push(cell.c);
+                    if let Some(z) = cell.zerowidth() {
+                        text.extend(z);
+                    }
+                } else {
+                    let cells = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+                    let s: String = std::iter::once(cell.c).chain(cell.zerowidth().into_iter().flatten().copied()).collect();
+                    foreign.push((cell.point.column.0, r, s, fg, cells));
+                    text.push_str(&" ".repeat(cells));
                 }
                 match spans.last_mut() {
                     Some(s) if s.2 == fg && s.3 == bold => s.1 = text.len(),
@@ -461,16 +547,22 @@ impl Tab {
             // While waiting, the cursor row is just the "> " prompt: push it under the card.
             let waiting = (self.idle && self.integrated) as i32;
             self.shift = if alt { 0 } else { (term.screen_lines() as i32 - 1 - cursor_row + waiting).max(0) as usize };
-            // A block header is drawn only where the row still shows its command (`cls` and the
-            // scrollback limit move rows around).
+            // Headers are found by content, not by remembered rows: those drift (ConPTY repaints, `cls`).
+            // A header row starts with our prompt, "> " in ACCENT, followed by a command.
             let history = term.history_size() as i64;
-            for (abs, cmd) in self.blocks.iter().filter(|_| !alt) {
-                let r = *abs as i64 - history + offset as i64;
-                let Some(&s) = usize::try_from(r).ok().and_then(|r| row_starts.get(r)) else { continue };
-                let line = text[s..].split('\n').next().unwrap_or("");
-                if line.contains(cmd.as_str()) {
-                    self.headers.push(r as i32);
+            // The prompt where the cursor waits is the next command, not a block yet.
+            let waiting_row = (self.idle as i32 == 1).then_some(cursor_row);
+            for r in prompt_rows.into_iter().filter(|&r| !alt && waiting_row != Some(r as i32)) {
+                let line = text[row_starts[r]..].split('\n').next().unwrap_or("");
+                let cmd = line.get(2..).unwrap_or("").trim();
+                if cmd.is_empty() {
+                    continue;
                 }
+                // Time of the run: the sent block with this command nearest to the row.
+                let abs = r as i64 - offset as i64 + history;
+                let time = self.blocks.iter().filter(|b| b.1 == cmd).min_by_key(|b| (b.0 as i64 - abs).abs()).map_or("", |b| b.2.as_str());
+                let metrics = self.term_buf.metrics();
+                self.headers.push((r as i32, label_buf(fs, metrics, time, MUTED, false)));
             }
         }
         let attrs = mono();
@@ -484,6 +576,22 @@ impl Tab {
             None,
         );
         self.term_buf.shape_until_scroll(fs, false);
+        let metrics = self.term_buf.metrics();
+        for (col, row, s, fg, cells) in foreign {
+            let room = cells as f32 * cw;
+            let mut b = Buffer::new(fs, metrics);
+            let attrs = mono().color(Color::rgb(fg.r, fg.g, fg.b));
+            b.set_text(&s, &attrs, Shaping::Advanced, None);
+            b.shape_until_scroll(fs, false);
+            // Too wide for its cells: shrink it. The advance includes wide side bearings, so it may
+            // overhang half a cell before the ink touches its neighbours.
+            if line_w(&b) > room * 1.5 {
+                let size = metrics.font_size * room * 1.5 / line_w(&b);
+                b.set_metrics(Metrics::new(size, metrics.line_height));
+                b.shape_until_scroll(fs, false);
+            }
+            self.glyphs.push((col as f32 * cw + (room - line_w(&b)) / 2.0, row, b));
+        }
         self.term_dirty = false;
     }
 }
@@ -511,8 +619,9 @@ struct State {
     history: Vec<String>,
     metrics: Metrics,
     chip_metrics: Metrics,
-    badge_metrics: Metrics,
     plus: Buffer,
+    close: Buffer,
+    hover: Option<usize>,
     ghost_buf: Buffer,
     ghost: String,
     rects: Vec<f32>,
@@ -526,6 +635,9 @@ struct State {
     mods: ModifiersState,
     mouse: (f32, f32),
     dragging: bool,
+    // Dragging a selection over the terminal output.
+    selecting: bool,
+    term_top: f32,
     last_click: Option<Instant>,
     focused: bool,
     blink_on: bool,
@@ -577,9 +689,9 @@ impl State {
         let scale = window.scale_factor() as f32;
         let metrics = Metrics::new(FONT * scale, (LINE * scale).round());
         let chip_metrics = Metrics::new(CHIP_FONT * scale, (CHIP_LINE * scale).round());
-        let badge_metrics = Metrics::new(11.5 * scale, (15.0 * scale).round());
         let cell = (measure_cell(&mut gpu.font_system, metrics), metrics.line_height);
-        let plus = label_buf(&mut gpu.font_system, Metrics::new(18.0 * scale, (22.0 * scale).round()), "+", MUTED, false);
+        let plus = icon_buf(&mut gpu.font_system, (14.0 * scale).round(), "\u{E710}", MUTED);
+        let close = icon_buf(&mut gpu.font_system, (8.0 * scale).round(), "\u{E711}", FG);
         let ghost_buf = Buffer::new(&mut gpu.font_system, metrics);
         let history = load_history();
         let mut s = State {
@@ -592,8 +704,9 @@ impl State {
             history,
             metrics,
             chip_metrics,
-            badge_metrics,
             plus,
+            close,
+            hover: None,
             ghost_buf,
             ghost: String::new(),
             rects: Vec::new(),
@@ -606,6 +719,8 @@ impl State {
             mods: ModifiersState::empty(),
             mouse: (0.0, 0.0),
             dragging: false,
+            selecting: false,
+            term_top: 0.0,
             last_click: None,
             focused: true,
             blink_on: true,
@@ -639,7 +754,8 @@ impl State {
         };
         let opts = tty::Options {
             shell: Some(tty::Shell::new(program, args)),
-            working_directory: None,
+            // Every tab starts in the user's home, like Warp.
+            working_directory: std::env::var_os("USERPROFILE").map(Into::into),
             drain_on_exit: false,
             // WSLENV forwards PROMPT_COMMAND into WSL.
             env: HashMap::from([
@@ -662,8 +778,8 @@ impl State {
         term_buf.set_monospace_width(Some(self.cell.0));
         let mut editor = Editor::new(Buffer::new(fs, self.metrics));
         editor.with_buffer_mut(|b| b.set_monospace_width(Some(self.cell.0)));
-        let (label, _, fg) = kind.badge();
-        let badge = label_buf(fs, self.badge_metrics, label, fg, true);
+        let (icon, _, fg) = kind.badge();
+        let badge = icon_buf(fs, (ICON * self.scale).round(), icon, fg);
         self.tabs.push(Tab {
             id,
             term,
@@ -676,6 +792,7 @@ impl State {
             editor,
             term_dirty: true,
             cell_bgs: Vec::new(),
+            glyphs: Vec::new(),
             term_cursor: None,
             shift: 0,
             blocks: Vec::new(),
@@ -685,6 +802,7 @@ impl State {
             undo: Vec::new(),
             typing: false,
             hist_pos: self.history.len(),
+            cwd: None,
         });
         self.active = self.tabs.len() - 1;
         self.layout();
@@ -694,6 +812,7 @@ impl State {
     fn close_tab(&mut self, i: usize) -> bool {
         let t = self.tabs.remove(i);
         let _ = t.pty.send(Msg::Shutdown);
+        self.hover = None;
         if self.tabs.is_empty() {
             return false;
         }
@@ -757,14 +876,15 @@ impl State {
         let t = &mut self.tabs[i];
         t.idle = true;
         t.term_dirty = true;
+        t.cwd = win_path(cwd);
         t.shell_label = match shell {
             "ps" => "PowerShell".into(),
             s => s.strip_prefix("wsl:").map_or_else(|| s.to_string(), |d| format!("WSL {d}")),
         };
         if kind != t.kind {
             t.kind = kind;
-            let (label, _, fg) = kind.badge();
-            t.badge = label_buf(fs, self.badge_metrics, label, fg, true);
+            let (icon, _, fg) = kind.badge();
+            t.badge = icon_buf(fs, (ICON * self.scale).round(), icon, fg);
         }
         let (proxy, id, cwd) = (self.proxy.clone(), t.id, cwd.to_string());
         std::thread::spawn(move || {
@@ -822,12 +942,28 @@ impl State {
             term.scroll_display(Scroll::Bottom);
             // The prompt is invisible, so the shell echoes the command where the cursor is now.
             let abs = term.history_size() + term.grid().cursor.point.line.0.max(0) as usize;
-            t.blocks.push((abs, cmd.lines().next().unwrap_or("").trim().to_string()));
+            t.blocks.push((abs, cmd.lines().next().unwrap_or("").trim().to_string(), local_time()));
         }
         // Each line goes as if typed and followed by Enter.
         t.send(format!("{}\r", cmd.replace('\n', "\r")).into_bytes());
         t.idle = !t.integrated;
         t.term_dirty = true;
+    }
+
+    /// Copies and clears the output selection; false when there is none.
+    fn copy_output(&mut self) -> bool {
+        let text = {
+            let mut term = self.tab().term.lock();
+            let text = term.selection_to_string().filter(|s| !s.is_empty());
+            term.selection = None;
+            text
+        };
+        let Some(text) = text else { return false };
+        self.tab().term_dirty = true;
+        if let Some(cb) = self.clipboard.as_mut() {
+            let _ = cb.set_text(text);
+        }
+        true
     }
 
     fn suggestion(&self) -> Option<String> {
@@ -850,6 +986,17 @@ impl State {
         let fs = &mut gpu.font_system;
         let t = &mut tabs[*active];
         let single_line = !t.text().contains('\n');
+        // Tab completes a path first: history suggestions may come from another shell (`Documents\` from
+        // PowerShell is a line continuation in bash).
+        let sep = if matches!(t.kind, Kind::Bash | Kind::Wsl) { '/' } else { '\\' };
+        let path = (ev.logical_key == Key::Named(NamedKey::Tab))
+            .then(|| t.cwd.as_deref().filter(|_| t.cursor_at_end()).and_then(|c| complete_path(&t.text(), Path::new(c), sep)))
+            .flatten();
+        if let Some(new) = path {
+            let old = t.text();
+            t.undo.push(old);
+            return t.set_text(fs, &new);
+        }
         if let Key::Named(n) = &ev.logical_key {
             let word = |w, c| if ctrl { w } else { c };
             match n {
@@ -878,7 +1025,6 @@ impl State {
                 NamedKey::ArrowUp => t.motion(fs, Motion::Up, shift),
                 NamedKey::ArrowDown => t.motion(fs, Motion::Down, shift),
                 NamedKey::Escape => t.editor.set_selection(Selection::None),
-                // shortcut: no path/command completion yet, only history suggestions.
                 NamedKey::Tab => {}
                 _ => insert_text(t, fs, ev),
             }
@@ -937,7 +1083,11 @@ impl State {
 
     /// Y of the i-th sidebar slot (tabs, then the + button).
     fn slot_y(&self, i: usize) -> f32 {
-        self.px(MARGIN) + i as f32 * (self.px(BADGE) + self.px(8.0))
+        self.px(MARGIN) + i as f32 * self.slot_pitch()
+    }
+
+    fn slot_pitch(&self) -> f32 {
+        self.px(BADGE) + self.px(8.0)
     }
 
     /// Builds this frame's rectangles; returns the terminal text's top y.
@@ -962,32 +1112,38 @@ impl State {
             }
             self.rect(bx, y, bs, bs, bg, if active { 1.0 } else { 0.55 }, self.px(8.0));
         }
+        if let Some((x, y, d)) = self.hover.map(|i| self.close_box(i)) {
+            self.rect(x - 1.0, y - 1.0, d + 2.0, d + 2.0, SIDEBAR_BG, 1.0, d / 2.0 + 1.0);
+            self.rect(x, y, d, d, PILL, 1.0, d / 2.0);
+        }
         let y = self.slot_y(self.tabs.len());
         self.rect(bx, y, bs, bs, PILL, 1.0, self.px(8.0));
 
         let fs = &mut self.gpu.font_system;
         let t = &mut self.tabs[self.active];
         if t.term_dirty {
-            t.build_term(fs);
+            t.build_term(fs, cw);
         }
         t.editor.shape_as_needed(fs, false);
         let lines = t.editor.with_buffer(|b| b.layout_runs().count()).clamp(1, MAX_EDITOR_LINES);
         let (shift, idle, term_cursor) = (t.shift, t.idle, t.term_cursor);
-        let headers = t.headers.clone();
+        let headers: Vec<i32> = t.headers.iter().map(|h| h.0).collect();
         let bgs = t.cell_bgs.clone();
         let card_h = self.card_h(lines);
         let card_top = h - m - card_h;
         // A taller editor covers the oldest rows instead of resizing the shell.
         let term_y = m + shift as f32 * ch - (card_h - self.card_h(1));
         self.card_top = card_top;
+        self.term_top = term_y;
 
-        // Command blocks: a band with an accent bar behind the echoed command, a rule above it.
+        // Command blocks: a band with an accent bar behind the echoed command, and a rule through
+        // the blank row the prompt leaves above it.
         for r in headers {
             let y = term_y + r as f32 * ch;
             self.rect(left - self.px(4.0), y, w - left - m + self.px(4.0), ch, BLOCK, 1.0, self.px(4.0));
             self.rect(left - self.px(4.0), y, self.px(3.0), ch, ACCENT, 0.9, self.px(1.5));
             if r > 0 {
-                self.rect(left, y - self.px(3.0), w - left - m, 1.0, BORDER, 0.6, 0.0);
+                self.rect(left - self.px(4.0), y - (ch / 2.0).round(), w - left - m + self.px(4.0), 1.0, BORDER, 1.0, 0.0);
             }
         }
         for (c, r, bg) in bgs {
@@ -1064,13 +1220,18 @@ impl State {
             .tabs
             .iter()
             .enumerate()
-            .map(|(i, t)| (bx + (bs - line_w(&t.badge)) / 2.0, self.slot_y(i) + (bs - self.badge_metrics.line_height) / 2.0))
+            .map(|(i, t)| (bx + (bs - line_w(&t.badge)) / 2.0, self.slot_y(i) + (bs - t.badge.metrics().line_height) / 2.0))
             .collect();
-        let plus_pos = (bx + (bs - line_w(&self.plus)) / 2.0, self.slot_y(self.tabs.len()) + self.px(5.0));
+        let plus_pos = (bx + (bs - line_w(&self.plus)) / 2.0, self.slot_y(self.tabs.len()) + (bs - self.plus.metrics().line_height) / 2.0);
+        let close_pos = self.hover.map(|i| {
+            let (x, y, d) = self.close_box(i);
+            (x + (d - line_w(&self.close)) / 2.0, y + (d - self.close.metrics().line_height) / 2.0)
+        });
         let t = &self.tabs[self.active];
         let editor_color = color(if t.idle { FG } else { 0x5A5F6B });
         // Clip at the grid's last row, so a row pushed past it (the waiting prompt) stays hidden.
         let term_bottom = (term_y + (self.grid_size().0 as f32 - t.shift as f32) * self.cell.1).min(card_top - m / 2.0);
+        let (time_right, ch) = (w as f32 - m - self.px(10.0), self.cell.1);
         let g = &mut self.gpu;
         g.viewport.update(&g.queue, Resolution { width: w, height: h });
         let res = t.editor.with_buffer(|eb| {
@@ -1097,6 +1258,9 @@ impl State {
                 ]
                 .into_iter()
                 .chain(ghost)
+                .chain(close_pos.map(|(x, y)| area(&self.close, x, y, h as f32, color(FG))))
+                .chain(t.glyphs.iter().map(|(x, r, b)| area(b, left + x, term_y + *r as f32 * ch, term_bottom, color(FG))))
+                .chain(t.headers.iter().map(|(r, b)| area(b, time_right - line_w(b), term_y + *r as f32 * ch, term_bottom, color(MUTED))))
                 .chain(t.chips.iter().zip(&self.chip_x).map(|(b, &x)| area(b, x, chip_y, h as f32, color(MUTED))))
                 .chain(self.tabs.iter().zip(&badge_pos).map(|(tb, &(x, y))| area(&tb.badge, x, y, h as f32, color(FG)))),
                 &mut g.swash,
@@ -1162,9 +1326,44 @@ impl State {
         ((self.mouse.0 - self.editor_origin.0) as i32, (self.mouse.1 - self.editor_origin.1) as i32)
     }
 
+    /// Grid point and cell side under the mouse in the terminal output.
+    fn term_point(&mut self) -> (Point, Side) {
+        let (cw, ch) = self.cell;
+        let x = ((self.mouse.0 - self.content_left()) / cw).max(0.0);
+        let row = ((self.mouse.1 - self.term_top) / ch).floor().max(0.0) as i32;
+        let term = self.tab().term.lock();
+        let (rows, cols) = (term.screen_lines() as i32, term.columns());
+        let line = Line(row.min(rows - 1) - term.grid().display_offset() as i32);
+        let side = if x.fract() < 0.5 { Side::Left } else { Side::Right };
+        (Point::new(line, Column((x as usize).min(cols - 1))), side)
+    }
+
+    /// Tab whose badge is under the mouse, when there is more than one (the last one closes with Ctrl+Shift+W).
+    fn hovered_tab(&self) -> Option<usize> {
+        let i = ((self.mouse.1 - self.px(MARGIN)) / self.slot_pitch()).floor();
+        let inside = self.mouse.0 < self.px(SIDEBAR) && i >= 0.0 && self.mouse.1 - self.slot_y(i as usize) < self.px(BADGE);
+        (inside && (i as usize) < self.tabs.len() && self.tabs.len() > 1).then_some(i as usize)
+    }
+
+    /// The close button over a badge's top-right corner: (x, y, diameter).
+    fn close_box(&self, i: usize) -> (f32, f32, f32) {
+        let (d, bs) = (self.px(16.0), self.px(BADGE));
+        let x = (self.px(SIDEBAR) + bs) / 2.0 - d + self.px(5.0);
+        (x, self.slot_y(i) - self.px(5.0), d)
+    }
+
     fn click(&mut self) {
+        if let Some(i) = self.hover {
+            let (x, y, d) = self.close_box(i);
+            if (x..x + d).contains(&self.mouse.0) && (y..y + d).contains(&self.mouse.1) {
+                self.close_tab(i);
+                self.hover = self.hovered_tab();
+                self.window.request_redraw();
+                return;
+            }
+        }
         if self.mouse.0 < self.px(SIDEBAR) {
-            let slot = ((self.mouse.1 - self.px(MARGIN)) / (self.px(BADGE) + self.px(8.0))).floor();
+            let slot = ((self.mouse.1 - self.px(MARGIN)) / self.slot_pitch()).floor();
             match slot as usize {
                 _ if slot < 0.0 => {}
                 i if i < self.tabs.len() => self.switch(i),
@@ -1173,7 +1372,18 @@ impl State {
             }
             return;
         }
-        if !(self.tabs[self.active].idle && self.mouse.1 >= self.card_top) {
+        if self.mouse.1 < self.card_top {
+            let (p, side) = self.term_point();
+            self.tab().term.lock().selection = Some(TermSel::new(SelectionType::Simple, p, side));
+            self.tab().term_dirty = true;
+            self.selecting = true;
+            self.window.request_redraw();
+            return;
+        }
+        // A click in the editor drops the output selection, so Ctrl+C copies the editor again.
+        self.tab().term.lock().selection = None;
+        self.tab().term_dirty = true;
+        if !self.tabs[self.active].idle {
             return;
         }
         let (x, y) = self.editor_point();
@@ -1391,6 +1601,8 @@ impl ApplicationHandler<Ev> for App {
                 } else if ctrl && event.logical_key == Key::Named(NamedKey::Tab) {
                     let n = s.tabs.len();
                     s.switch(if shift { (s.active + n - 1) % n } else { (s.active + 1) % n });
+                } else if ctrl && key == "c" && s.copy_output() {
+                    // Copied the output selection instead of sending Ctrl+C, like Windows Terminal.
                 } else if s.tab().idle {
                     s.editor_key(&event);
                 } else {
@@ -1405,8 +1617,31 @@ impl ApplicationHandler<Ev> for App {
                 s.wake_cursor();
                 s.window.request_redraw();
             }
+            WindowEvent::CursorLeft { .. } if s.hover.is_some() => {
+                s.hover = None;
+                s.window.request_redraw();
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 s.mouse = (position.x as f32, position.y as f32);
+                // The close button only shows while a tab is hovered, and stays while reaching for it.
+                let over_close = s.hover.is_some_and(|i| {
+                    let (x, y, d) = s.close_box(i);
+                    (x..x + d).contains(&s.mouse.0) && (y..y + d).contains(&s.mouse.1)
+                });
+                let hover = if over_close { s.hover } else { s.hovered_tab() };
+                if hover != s.hover {
+                    s.hover = hover;
+                    s.window.request_redraw();
+                }
+                if s.selecting {
+                    let (p, side) = s.term_point();
+                    let t = s.tab();
+                    if let Some(sel) = t.term.lock().selection.as_mut() {
+                        sel.update(p, side);
+                    }
+                    t.term_dirty = true;
+                    s.window.request_redraw();
+                }
                 if s.dragging {
                     let (x, y) = s.editor_point();
                     let State { gpu, tabs, active, .. } = s;
@@ -1419,6 +1654,7 @@ impl ApplicationHandler<Ev> for App {
                     s.click();
                 } else {
                     s.dragging = false;
+                    s.selecting = false;
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1482,6 +1718,25 @@ mod tests {
         assert_eq!(suggest(&h, "git s"), Some("tatus"));
         assert_eq!(suggest(&h, "ls"), None);
         assert_eq!(suggest(&h, ""), None);
+    }
+
+    #[test]
+    fn path_completion() {
+        let d = std::env::temp_dir().join("zhur-complete-test");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::create_dir_all(d.join("Program Files")).unwrap();
+        std::fs::write(d.join("notes-a.txt"), "").unwrap();
+        std::fs::write(d.join("notes-b.txt"), "").unwrap();
+        let c = |t| complete_path(t, &d, '\\');
+        assert_eq!(c("cd sr").as_deref(), Some("cd src\\"));
+        assert_eq!(c("ls ./SR").as_deref(), Some("ls ./src/"));
+        assert_eq!(c("cat no").as_deref(), Some("cat notes-"));
+        assert_eq!(c("cat notes-"), None);
+        assert_eq!(c("cd prog").as_deref(), Some("cd \"Program Files\\"));
+        assert_eq!(c("cd \"prog").as_deref(), Some("cd \"Program Files\\"));
+        assert_eq!(c("cd zz"), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
